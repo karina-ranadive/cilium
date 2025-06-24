@@ -20,6 +20,6 @@ func (t egresstoSpecificNamespace) build(ct *check.ConnectivityTest, templates m
 	newTest("egress-to-specific-namespace-ccnp", ct).
 		WithFeatureRequirements(features.RequireEnabled(features.CCNP)).
 		WithCiliumClusterwidePolicy(templates["egresstoSpecificNS"]).
-		WithScenarios(tests.CCNPClienttoClient())
+		WithScenarios(tests.CCNPPodToPod())
 
 }

@@ -22,6 +22,6 @@ func (t ingressCCNPEgressCNPMulti) build(ct *check.ConnectivityTest, templates m
 		WithFeatureRequirements(features.RequireEnabled(features.CCNP)).
 		WithCiliumClusterwidePolicy(templates["ingressfromSpecificNS"]).
 		WithCiliumPolicy(egressfromSpecificNS).
-		WithScenarios(tests.CCNPClienttoClient())
+		WithScenarios(tests.CCNPPodToPod())
 
 }

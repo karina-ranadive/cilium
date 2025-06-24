@@ -13,18 +13,18 @@ import (
 
 // ClientToClient sends an ICMP packet from each client Pod
 // to each client Pod in the test context.
-func CCNPClienttoClient() check.Scenario {
-	return &CCNPClientClient{}
+func CCNPPodToPod() check.Scenario {
+	return &CCNPPodPod{}
 }
 
 // clientToClient implements a Scenario.
-type CCNPClientClient struct{}
+type CCNPPodPod struct{}
 
-func (s *CCNPClientClient) Name() string {
+func (s *CCNPPodPod) Name() string {
 	return "ccnp-client-to-client"
 }
 
-func (s *CCNPClientClient) Run(ctx context.Context, t *check.Test) {
+func (s *CCNPPodPod) Run(ctx context.Context, t *check.Test) {
 
 	var i int
 	ct := t.Context()

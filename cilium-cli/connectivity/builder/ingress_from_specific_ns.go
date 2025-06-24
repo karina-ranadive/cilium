@@ -20,6 +20,6 @@ func (t ingressfromSpecificNamespace) build(ct *check.ConnectivityTest, template
 	newTest("ingress-from-specific-namespace-ccnp", ct).
 		WithFeatureRequirements(features.RequireEnabled(features.CCNP)).
 		WithCiliumClusterwidePolicy(templates["ingressfromSpecificNS"]).
-		WithScenarios(tests.CCNPClienttoClient())
+		WithScenarios(tests.CCNPPodToPod())
 
 }
