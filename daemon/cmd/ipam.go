@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 
 	"github.com/cilium/hive/cell"
 	"github.com/cilium/hive/job"
 	"github.com/cilium/statedb"
+	cniInvoke "github.com/containernetworking/cni/pkg/invoke"
+	cniTypesV1 "github.com/containernetworking/cni/pkg/types/100"
 
 	"github.com/cilium/cilium/pkg/cidr"
 	linuxrouting "github.com/cilium/cilium/pkg/datapath/linux/routing"
@@ -321,6 +325,13 @@ func (d *Daemon) allocateHealthIPs() error {
 func (d *Daemon) allocateIngressIPs() error {
 	bootstrapStats.ingressIPAM.Start()
 	if option.Config.EnableEnvoyConfig {
+		if option.Config.IPAM == ipamOption.IPAMDelegatedPlugin {
+			if err := d.allocateIngressIPsWithDelegatedPlugin(); err != nil {
+				return err
+			}
+			bootstrapStats.ingressIPAM.End(true)
+			return nil
+		}
 		if option.Config.EnableIPv4 {
 			var result *ipam.AllocationResult
 			var err error
@@ -427,6 +438,109 @@ func (d *Daemon) allocateIngressIPs() error {
 		}
 	}
 	bootstrapStats.ingressIPAM.End(true)
+	return nil
+}
+
+func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
+	if d.cniConfigManager == nil {
+		return fmt.Errorf("cni config manager is not available for delegated ingress IP allocation")
+	}
+
+	netConf, rawConfig, err := d.cniConfigManager.GetCiliumNetConf()
+	if err != nil {
+		return fmt.Errorf("unable to load CNI configuration for delegated ingress IP allocation: %w", err)
+	}
+	if netConf.IPAM.Type == "" {
+		return fmt.Errorf("delegated IPAM plugin type is not configured in the CNI configuration")
+	}
+
+	cniPath := os.Getenv("CNI_PATH")
+	if cniPath == "" {
+		return fmt.Errorf("CNI_PATH must be set to invoke delegated IPAM plugin %q", netConf.IPAM.Type)
+	}
+
+	exec := &cniInvoke.DefaultExec{
+		RawExec: &cniInvoke.RawExec{Stderr: os.Stderr},
+	}
+	pluginPath, err := exec.FindInPath(netConf.IPAM.Type, filepath.SplitList(cniPath))
+	if err != nil {
+		return fmt.Errorf("failed to locate delegated IPAM plugin %q in CNI_PATH %q: %w", netConf.IPAM.Type, cniPath, err)
+	}
+
+	containerID := fmt.Sprintf("cilium-ingress-%s", nodeTypes.GetName())
+	ifName := "cilium-ingress"
+	netNS := "/proc/self/ns/net"
+	args := &cniInvoke.Args{
+		Command:     "ADD",
+		ContainerID: containerID,
+		NetNS:       netNS,
+		IfName:      ifName,
+		Path:        cniPath,
+	}
+
+	release := func() {
+		delArgs := &cniInvoke.Args{
+			Command:     "DEL",
+			ContainerID: containerID,
+			NetNS:       netNS,
+			IfName:      ifName,
+			Path:        cniPath,
+		}
+		if err := cniInvoke.ExecPluginWithoutResult(d.ctx, pluginPath, rawConfig, delArgs, exec); err != nil {
+			d.logger.Warn("Failed to release delegated ingress IPs", logfields.Error, err)
+		}
+	}
+
+	ipamRawResult, err := cniInvoke.ExecPluginWithResult(d.ctx, pluginPath, rawConfig, args, exec)
+	if err != nil {
+		return fmt.Errorf("failed to invoke delegated IPAM plugin ADD for ingress IPs: %w", err)
+	}
+
+	ipamResult, err := cniTypesV1.NewResultFromResult(ipamRawResult)
+	if err != nil {
+		release()
+		return fmt.Errorf("could not interpret delegated IPAM result for ingress IPs: %w", err)
+	}
+
+	var ingressIPv4, ingressIPv6 net.IP
+	for _, ipConfig := range ipamResult.IPs {
+		ipAddr := ipConfig.Address.IP
+		if ipAddr == nil {
+			continue
+		}
+		if ipAddr.To4() != nil {
+			if ingressIPv4 == nil {
+				ingressIPv4 = ipAddr
+			} else {
+				d.logger.Warn("Delegated IPAM returned multiple IPv4 ingress IPs, ignoring extra entries")
+			}
+			continue
+		}
+		if ingressIPv6 == nil {
+			ingressIPv6 = ipAddr
+		} else {
+			d.logger.Warn("Delegated IPAM returned multiple IPv6 ingress IPs, ignoring extra entries")
+		}
+	}
+
+	if option.Config.EnableIPv4 && ingressIPv4 == nil {
+		release()
+		return fmt.Errorf("delegated IPAM plugin did not return an IPv4 ingress IP")
+	}
+	if option.Config.EnableIPv6 && ingressIPv6 == nil {
+		release()
+		return fmt.Errorf("delegated IPAM plugin did not return an IPv6 ingress IP")
+	}
+
+	if ingressIPv4 != nil {
+		node.SetIngressIPv4(ingressIPv4)
+		d.logger.Info(fmt.Sprintf("  Ingress IPv4: %s", ingressIPv4))
+	}
+	if ingressIPv6 != nil {
+		node.SetIngressIPv6(ingressIPv6)
+		d.logger.Info(fmt.Sprintf("  Ingress IPv6: %s", ingressIPv6))
+	}
+
 	return nil
 }
 

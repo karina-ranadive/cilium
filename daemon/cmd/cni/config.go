@@ -94,6 +94,72 @@ func (c *cniConfigManager) GetCustomNetConf() *cnitypes.NetConf {
 	return conf
 }
 
+// GetCiliumNetConf returns the Cilium CNI config (raw bytes and parsed) from either
+// the configured read-cni-conf path or the generated config path.
+func (c *cniConfigManager) GetCiliumNetConf() (*cnitypes.NetConf, []byte, error) {
+	configPath, err := c.cniConfigPath()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rawConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to read CNI configuration '%s': %w", configPath, err)
+	}
+
+	netConf, rawPluginConfig, err := loadCiliumNetConf(rawConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return netConf, rawPluginConfig, nil
+}
+
+type cniConfigList struct {
+	Plugins []json.RawMessage `json:"plugins,omitempty"`
+}
+
+type cniConfigType struct {
+	Type string `json:"type"`
+}
+
+func (c *cniConfigManager) cniConfigPath() (string, error) {
+	if c.config.ReadCNIConf != "" {
+		return c.config.ReadCNIConf, nil
+	}
+	if c.config.WriteCNIConfWhenReady != "" {
+		return c.config.WriteCNIConfWhenReady, nil
+	}
+	return "", fmt.Errorf("no CNI configuration path is available")
+}
+
+func loadCiliumNetConf(rawConfig []byte) (*cnitypes.NetConf, []byte, error) {
+	var configList cniConfigList
+	if err := json.Unmarshal(rawConfig, &configList); err == nil && len(configList.Plugins) > 0 {
+		for _, pluginConfig := range configList.Plugins {
+			var configType cniConfigType
+			if err := json.Unmarshal(pluginConfig, &configType); err != nil {
+				continue
+			}
+			if configType.Type != "cilium-cni" {
+				continue
+			}
+			netConf, err := cnitypes.LoadNetConf(pluginConfig)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to load cilium-cni config from conflist: %w", err)
+			}
+			return netConf, pluginConfig, nil
+		}
+		return nil, nil, fmt.Errorf("unable to find cilium-cni configuration in CNI conflist")
+	}
+
+	netConf, err := cnitypes.LoadNetConf(rawConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load cilium-cni config: %w", err)
+	}
+	return netConf, rawConfig, nil
+}
+
 // cniConfigs are the default configurations, per chaining mode
 var cniConfigs map[string]string = map[string]string{
 	// the default

@@ -15,6 +15,7 @@ import (
 	"github.com/cilium/statedb"
 	"github.com/vishvananda/netlink"
 
+	cnicell "github.com/cilium/cilium/daemon/cmd/cni"
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/clustermesh"
 	"github.com/cilium/cilium/pkg/controller"
@@ -127,6 +128,8 @@ type Daemon struct {
 
 	lbConfig loadbalancer.Config
 	kprCfg   kpr.KPRConfig
+
+	cniConfigManager cnicell.CNIConfigManager
 }
 
 func (d *Daemon) init() error {
@@ -306,6 +309,7 @@ func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams
 		endpointMetadata:  params.EndpointMetadata,
 		k8sWatcher:        params.K8sWatcher,
 		ipam:              params.IPAM,
+		cniConfigManager:  params.CNIConfigManager,
 		maglevConfig:      params.MaglevConfig,
 		lbConfig:          params.LBConfig,
 		kprCfg:            params.KPRConfig,

@@ -127,16 +127,14 @@ if ipv6Enabled {
 
 ## 4) Why a dedicated IP is required for Envoy/Gateway
 
-### Explicit requirement in config validation
-The agent config enforces that Envoy/Gateway requires the agent to create a dedicated IP. This is why delegated IPAM is incompatible with Envoy config:
+### Delegated IPAM support for Envoy/Gateway
+When delegated IPAM is enabled, the agent now invokes the delegated IPAM plugin
+using the CNI config to allocate per-node ingress IPs for Envoy/Gateway. This
+keeps the ingress identity enforcement model intact while allowing delegated IPAM.
 
 ```go
-// envoy config (Ingress, Gateway API, ...) require cilium-agent to create an IP address
-// specifically for differentiating envoy traffic, which is not possible
-// with delegated IPAM.
-if c.EnableEnvoyConfig {
-	return fmt.Errorf("--%s must be disabled with --%s=%s", EnableEnvoyConfig, IPAM, ipamOption.IPAMDelegatedPlugin)
-}
+netConf, rawConfig, err := d.cniConfigManager.GetCiliumNetConf()
+ipamRawResult, err := cniInvoke.ExecPluginWithResult(d.ctx, pluginPath, rawConfig, args, exec)
 ```
 
 ### The routing-table reason (not just “marks”)
@@ -462,15 +460,10 @@ arrives at the ``ingress`` identity, and after, when it is about to exit the
 per-node Envoy.
 ```
 
-### Dedicated IP requirement (delegated IPAM restriction)
-```go
-// envoy config (Ingress, Gateway API, ...) require cilium-agent to create an IP address
-// specifically for differentiating envoy traffic, which is not possible
-// with delegated IPAM.
-if c.EnableEnvoyConfig {
-	return fmt.Errorf("--%s must be disabled with --%s=%s", EnableEnvoyConfig, IPAM, ipamOption.IPAMDelegatedPlugin)
-}
-```
+### Delegated IPAM and dedicated ingress IPs
+When delegated IPAM is enabled, the agent allocates the ingress IPs via the
+delegated IPAM plugin instead of the built-in IPAM allocator. This preserves the
+dedicated ingress IP model required for Envoy/Gateway identity enforcement.
 
 ### Proxy routing: local route + next-hop to Cilium internal IP
 ```go
