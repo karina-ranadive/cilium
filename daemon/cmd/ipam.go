@@ -442,18 +442,22 @@ func (d *Daemon) allocateIngressIPs() error {
 }
 
 func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
+	// Stage 1: Ensure the CNI config manager is available so we can read CNI config.
 	if d.cniConfigManager == nil {
 		return fmt.Errorf("cni config manager is not available for delegated ingress IP allocation")
 	}
 
+	// Stage 2: Load the active CNI configuration and the raw config bytes for plugin invocation.
 	netConf, rawConfig, err := d.cniConfigManager.GetCiliumNetConf()
 	if err != nil {
 		return fmt.Errorf("unable to load CNI configuration for delegated ingress IP allocation: %w", err)
 	}
+	// Stage 3: Validate that the delegated IPAM plugin type is set in the CNI config.
 	if netConf.IPAM.Type == "" {
 		return fmt.Errorf("delegated IPAM plugin type is not configured in the CNI configuration")
 	}
 
+	// Stage 4: Resolve CNI_PATH and locate the delegated IPAM plugin binary.
 	cniPath := os.Getenv("CNI_PATH")
 	if cniPath == "" {
 		return fmt.Errorf("CNI_PATH must be set to invoke delegated IPAM plugin %q", netConf.IPAM.Type)
@@ -467,6 +471,8 @@ func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
 		return fmt.Errorf("failed to locate delegated IPAM plugin %q in CNI_PATH %q: %w", netConf.IPAM.Type, cniPath, err)
 	}
 
+	// Stage 5: Build the CNI args for the delegated IPAM ADD call.
+	// We use the agent's netns so the plugin can run in the host namespace.
 	containerID := fmt.Sprintf("cilium-ingress-%s", nodeTypes.GetName())
 	ifName := "cilium-ingress"
 	netNS := "/proc/self/ns/net"
@@ -478,6 +484,7 @@ func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
 		Path:        cniPath,
 	}
 
+	// Stage 6: Prepare a best-effort release path to avoid leaking IPs when parsing fails.
 	release := func() {
 		delArgs := &cniInvoke.Args{
 			Command:     "DEL",
@@ -491,17 +498,20 @@ func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
 		}
 	}
 
+	// Stage 7: Invoke the delegated IPAM plugin ADD command to allocate ingress IPs.
 	ipamRawResult, err := cniInvoke.ExecPluginWithResult(d.ctx, pluginPath, rawConfig, args, exec)
 	if err != nil {
 		return fmt.Errorf("failed to invoke delegated IPAM plugin ADD for ingress IPs: %w", err)
 	}
 
+	// Stage 8: Parse the delegated IPAM result into the CNI v1 result structure.
 	ipamResult, err := cniTypesV1.NewResultFromResult(ipamRawResult)
 	if err != nil {
 		release()
 		return fmt.Errorf("could not interpret delegated IPAM result for ingress IPs: %w", err)
 	}
 
+	// Stage 9: Select at most one IPv4 and one IPv6 ingress IP from the result.
 	var ingressIPv4, ingressIPv6 net.IP
 	for _, ipConfig := range ipamResult.IPs {
 		ipAddr := ipConfig.Address.IP
@@ -523,6 +533,7 @@ func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
 		}
 	}
 
+	// Stage 10: Ensure required address families were returned by the plugin.
 	if option.Config.EnableIPv4 && ingressIPv4 == nil {
 		release()
 		return fmt.Errorf("delegated IPAM plugin did not return an IPv4 ingress IP")
@@ -532,6 +543,7 @@ func (d *Daemon) allocateIngressIPsWithDelegatedPlugin() error {
 		return fmt.Errorf("delegated IPAM plugin did not return an IPv6 ingress IP")
 	}
 
+	// Stage 11: Persist ingress IPs to the local node state for policy enforcement.
 	if ingressIPv4 != nil {
 		node.SetIngressIPv4(ingressIPv4)
 		d.logger.Info(fmt.Sprintf("  Ingress IPv4: %s", ingressIPv4))
