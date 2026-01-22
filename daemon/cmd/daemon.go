@@ -6,7 +6,15 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"net"
+	"sync"
 
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+	"github.com/vishvananda/netlink"
+
+	cnicell "github.com/cilium/cilium/daemon/cmd/cni"
 	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	linuxdatapath "github.com/cilium/cilium/pkg/datapath/linux"
 	"github.com/cilium/cilium/pkg/datapath/linux/ipsec"
@@ -27,47 +35,176 @@ const (
 	AutoCIDR = "auto"
 )
 
-func initAndValidateDaemonConfig(params daemonConfigParams) error {
-	// WireGuard and IPSec are mutually exclusive.
-	if params.IPSecConfig.Enabled() && params.WireguardConfig.Enabled() {
-		return fmt.Errorf("WireGuard (--%s) cannot be used with IPsec (--%s)", wgTypes.EnableWireguard, datapath.EnableIPSec)
+// Daemon is the cilium daemon that is in charge of perform all necessary plumbing,
+// monitoring when a LXC starts.
+type Daemon struct {
+	ctx             context.Context
+	logger          *slog.Logger
+	metricsRegistry *metrics.Registry
+	clientset       k8sClient.Clientset
+	db              *statedb.DB
+	policy          policy.PolicyRepository
+	idmgr           identitymanager.IDManager
+
+	monitorAgent monitoragent.Agent
+
+	directRoutingDev datapathTables.DirectRoutingDevice
+	routes           statedb.Table[*datapathTables.Route]
+	devices          statedb.Table[*datapathTables.Device]
+	nodeAddrs        statedb.Table[datapathTables.NodeAddress]
+
+	clustermesh *clustermesh.ClusterMesh
+
+	mtuConfig mtu.MTU
+
+	nodeAddressing datapath.NodeAddressing
+
+	// nodeDiscovery defines the node discovery logic of the agent
+	nodeDiscovery  *nodediscovery.NodeDiscovery
+	nodeLocalStore *node.LocalNodeStore
+
+	// ipam is the IP address manager of the agent
+	ipam *ipam.IPAM
+
+	endpointCreator endpointcreator.EndpointCreator
+	endpointManager endpointmanager.EndpointManager
+
+	endpointRestoreComplete       chan struct{}
+	endpointInitialPolicyComplete chan struct{}
+
+	identityAllocator identitycell.CachingIdentityAllocator
+	identityRestorer  *identityrestoration.LocalIdentityRestorer
+	ipcache           *ipcache.IPCache
+
+	k8sWatcher *watchers.K8sWatcher
+
+	endpointMetadata endpointmetadata.EndpointMetadataFetcher
+
+	// healthEndpointRouting is the information required to set up the health
+	// endpoint's routing in ENI or Azure IPAM mode
+	healthEndpointRouting *linuxrouting.RoutingInfo
+
+	ciliumHealth health.CiliumHealthManager
+
+	// Controllers owned by the daemon
+	controllers *controller.Manager
+	jobGroup    job.Group
+
+	bwManager datapath.BandwidthManager
+
+	maglevConfig maglev.Config
+
+	lbConfig loadbalancer.Config
+	kprCfg   kpr.KPRConfig
+
+	cniConfigManager cnicell.CNIConfigManager
+}
+
+func (d *Daemon) init() error {
+	if !option.Config.DryMode {
+		if option.Config.EnableL7Proxy {
+			if err := linuxdatapath.NodeEnsureLocalRoutingRule(); err != nil {
+				return fmt.Errorf("ensuring local routing rule: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// removeOldRouterState will try to ensure that the only IP assigned to the
+// `cilium_host` interface is the given restored IP. If the given IP is nil,
+// then it attempts to clear all IPs from the interface.
+func removeOldRouterState(logger *slog.Logger, ipv6 bool, restoredIP net.IP) error {
+	l, err := safenetlink.LinkByName(defaults.HostDevice)
+	if errors.As(err, &netlink.LinkNotFoundError{}) {
+		// There's no old state remove as the host device doesn't exist.
+		// This is always the case when the agent is started for the first time.
+		return nil
+	}
+	if err != nil {
+		return resiliency.Retryable(err)
 	}
 
-	if !params.IPSecConfig.DNSProxyInsecureSkipTransparentModeCheckEnabled() {
-		if params.IPSecConfig.Enabled() && params.DaemonConfig.EnableL7Proxy && !params.DaemonConfig.DNSProxyEnableTransparentMode {
-			return fmt.Errorf("IPSec requires DNS proxy transparent mode to be enabled (--dnsproxy-enable-transparent-mode=\"true\")")
+	family := netlink.FAMILY_V4
+	if ipv6 {
+		family = netlink.FAMILY_V6
+	}
+	addrs, err := safenetlink.AddrList(l, family)
+	if err != nil {
+		return resiliency.Retryable(err)
+	}
+
+	isRestoredIP := func(a netlink.Addr) bool {
+		return restoredIP != nil && restoredIP.Equal(a.IP)
+	}
+	if len(addrs) == 0 || (len(addrs) == 1 && isRestoredIP(addrs[0])) {
+		return nil // nothing to clean up
+	}
+
+	logger.Info("More than one stale router IP was found on the cilium_host device after restoration, cleaning up old router IPs.")
+
+	for _, a := range addrs {
+		if isRestoredIP(a) {
+			continue
+		}
+		logger.Debug(
+			"Removing stale router IP from cilium_host device",
+			logfields.IPAddr, a.IP,
+		)
+		if e := netlink.AddrDel(l, &a); e != nil {
+			err = errors.Join(err, resiliency.Retryable(fmt.Errorf("failed to remove IP %s: %w", a.IP, e)))
 		}
 	}
 
-	if params.IPSecConfig.Enabled() && params.DaemonConfig.TunnelingEnabled() {
-		if err := ipsec.ProbeXfrmStateOutputMask(); err != nil {
-			return fmt.Errorf("IPSec with tunneling requires support for xfrm state output masks (Linux 4.19 or later): %w", err)
+	return err
+}
+
+// removeOldCiliumHostIPs calls removeOldRouterState() for both IPv4 and IPv6
+// in a retry loop.
+func (d *Daemon) removeOldCiliumHostIPs(ctx context.Context, restoredRouterIPv4, restoredRouterIPv6 net.IP) {
+	gcHostIPsFn := func(ctx context.Context, retries int) (done bool, err error) {
+		var errs error
+		if option.Config.EnableIPv4 {
+			errs = errors.Join(errs, removeOldRouterState(d.logger, false, restoredRouterIPv4))
+		}
+		if option.Config.EnableIPv6 {
+			errs = errors.Join(errs, removeOldRouterState(d.logger, true, restoredRouterIPv6))
+		}
+		if resiliency.IsRetryable(errs) && !errors.As(errs, &netlink.LinkNotFoundError{}) {
+			d.logger.Warn(
+				"Failed to remove old router IPs from cilium_host.",
+				logfields.Error, errs,
+				logfields.Attempt, retries,
+			)
+			return false, nil
+		}
+		return true, errs
+	}
+	if err := resiliency.Retry(ctx, 100*time.Millisecond, 3, gcHostIPsFn); err != nil {
+		d.logger.Error("Restore of the cilium_host ips failed. Manual intervention is required to remove all other old IPs.", logfields.Error, err)
+	}
+}
+
+// newDaemon creates and returns a new Daemon with the parameters set in c.
+func newDaemon(ctx context.Context, cleaner *daemonCleanup, params *daemonParams) (*Daemon, *endpointRestoreState, error) {
+	var err error
+
+	bootstrapStats.daemonInit.Start()
+
+	// EncryptedOverlay feature must check the TunnelProtocol if enabled, since
+	// it only supports VXLAN right now.
+	if option.Config.EncryptionEnabled() && option.Config.EnableIPSecEncryptedOverlay {
+		if !option.Config.TunnelingEnabled() {
+			return nil, nil, fmt.Errorf("EncryptedOverlay support requires VXLAN tunneling mode")
+		}
+		if params.TunnelConfig.EncapProtocol() != tunnel.VXLAN {
+			return nil, nil, fmt.Errorf("EncryptedOverlay support requires VXLAN tunneling protocol")
 		}
 	}
 
-	if params.IPSecConfig.Enabled() && params.DaemonConfig.EnableEncryptionStrictModeIngress {
-		return fmt.Errorf("IPSec doesnt support strict ingress encryption.")
-	}
-
-	if params.DaemonConfig.EnableEncryptionStrictModeIngress && !params.DaemonConfig.TunnelingEnabled() {
-		return fmt.Errorf("Strict ingress encryption requires tunneling to be enabled.")
-	}
-
-	if params.DaemonConfig.EnableHostFirewall {
-		if params.IPSecConfig.Enabled() {
-			return fmt.Errorf("IPSec cannot be used with the host firewall.")
-		}
-	}
-
-	if params.DaemonConfig.LocalRouterIPv4 != "" || params.DaemonConfig.LocalRouterIPv6 != "" {
-		if params.IPSecConfig.Enabled() {
-			return fmt.Errorf("Cannot specify %s or %s with %s.", option.LocalRouterIPv4, option.LocalRouterIPv6, datapath.EnableIPSec)
-		}
-	}
-
-	if params.IPSecConfig.Enabled() || params.WireguardConfig.Enabled() {
-		if !params.DaemonConfig.EnableCiliumNodeCRD {
-			return fmt.Errorf("CiliumNode CRD cannot be disabled when encryption is enabled with WireGuard (--%s) or IPsec (--%s)", wgTypes.EnableWireguard, datapath.EnableIPSec)
+	if option.Config.TunnelingEnabled() && params.TunnelConfig.UnderlayProtocol() == tunnel.IPv6 {
+		if option.Config.EnableWireguard {
+			return nil, nil, fmt.Errorf("WireGuard requires an IPv4 underlay")
 		}
 	}
 
@@ -235,37 +372,90 @@ func configureDaemon(ctx context.Context, params daemonParams) error {
 		params.Clientset.IsEnabled() {
 		// **NOTE** The global identity allocator is not yet initialized here; that
 		// happens below via InitIdentityAllocator(). Only the local identity
-		// allocator is initialized up until here.
-		realIdentityAllocator := params.IdentityAllocator
-		realIdentityAllocator.InitIdentityAllocator(params.Clientset, params.KVStoreClient)
+		// allocator is initialized here.
+		identityAllocator: params.IdentityAllocator,
+		ipcache:           params.IPCache,
+		identityRestorer:  params.IdentityRestorer,
+		policy:            params.Policy,
+		idmgr:             params.IdentityManager,
+		clustermesh:       params.ClusterMesh,
+		monitorAgent:      params.MonitorAgent,
+		bwManager:         params.BandwidthManager,
+		endpointCreator:   params.EndpointCreator,
+		endpointManager:   params.EndpointManager,
+		endpointMetadata:  params.EndpointMetadata,
+		k8sWatcher:        params.K8sWatcher,
+		ipam:              params.IPAM,
+		cniConfigManager:  params.CNIConfigManager,
+		maglevConfig:      params.MaglevConfig,
+		lbConfig:          params.LBConfig,
+		kprCfg:            params.KPRConfig,
+		ciliumHealth:      params.CiliumHealth,
 	}
 
-	// Start the host IP synchronization. Blocks until the initial synchronization
-	// has finished.
-	if err := params.SyncHostIPs.StartAndWaitFirst(ctx); err != nil {
-		return err
+	// initialize endpointRestoreComplete channel as soon as possible so that subsystems
+	// can wait on it to get closed and not block forever if they happen so start
+	// waiting when it is not yet initialized (which causes them to block forever).
+	if option.Config.RestoreState {
+		d.endpointRestoreComplete = make(chan struct{})
+		d.endpointInitialPolicyComplete = make(chan struct{})
 	}
 
-	if err := params.IPsecAgent.StartBackgroundJobs(params.NodeHandler); err != nil {
-		params.Logger.Error("Unable to start IPsec key watcher", logfields.Error, err)
-	}
-
-	if !params.DaemonConfig.DryMode {
-		params.Logger.Info("Validating configured node address ranges")
-		if err := node.ValidatePostInit(params.Logger); err != nil {
-			return fmt.Errorf("postinit failed: %w", err)
+	// Collect CIDR identities from the "old" bpf ipcache and restore them
+	// in to the metadata layer.
+	if option.Config.RestoreState && !option.Config.DryMode {
+		// this *must* be called before initMaps(), which will "hide"
+		// the "old" ipcache.
+		err := d.identityRestorer.RestoreLocalIdentities()
+		if err != nil {
+			d.logger.Warn("Failed to restore existing identities from the previous ipcache. This may cause policy interruptions during restart.", logfields.Error, err)
 		}
 	}
 
-	bootstrapStats.overall.End(true)
-	bootstrapStats.updateMetrics()
+	bootstrapStats.daemonInit.End(true)
 
-	return nil
-}
+	// Stop all endpoints (its goroutines) on exit.
+	cleaner.cleanupFuncs.Add(func() {
+		d.logger.Info("Waiting for all endpoints' goroutines to be stopped.")
+		var wg sync.WaitGroup
 
-func unloadDNSPolicies(params daemonParams) {
-	if params.DaemonConfig.DNSPolicyUnloadOnShutdown {
-		params.Logger.Info("Unload DNS policies")
+		eps := d.endpointManager.GetEndpoints()
+		wg.Add(len(eps))
+
+		for _, ep := range eps {
+			go func(ep *endpoint.Endpoint) {
+				ep.Stop()
+				wg.Done()
+			}(ep)
+		}
+
+		wg.Wait()
+		d.logger.Info("All endpoints' goroutines stopped.")
+	})
+
+	// Open or create BPF maps.
+	bootstrapStats.mapsInit.Start()
+	err = d.initMaps()
+	bootstrapStats.mapsInit.EndError(err)
+	if err != nil {
+		d.logger.Error("error while opening/creating BPF maps", logfields.Error, err)
+		return nil, nil, fmt.Errorf("error while opening/creating BPF maps: %w", err)
+	}
+
+	debug.RegisterStatusObject("ipam", d.ipam)
+
+	if option.Config.DNSPolicyUnloadOnShutdown {
+		d.logger.Debug(
+			"Registering cleanup function to unload DNS policies due to option",
+			logfields.Option, option.DNSPolicyUnloadOnShutdown,
+		)
+
+		// add to pre-cleanup funcs because this needs to run on graceful shutdown, but
+		// before the relevant subystems are being shut down.
+		cleaner.preCleanupFuncs.Add(func() {
+			// Stop k8s watchers
+			d.logger.Info("Stopping k8s watcher")
+			d.k8sWatcher.StopWatcher()
 
 		// Iterate over the policy repository and remove L7 DNS part
 		needsPolicyRegen := false

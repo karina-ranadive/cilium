@@ -49,6 +49,7 @@ type CNIConfigManager interface {
 	Status() *models.Status
 
 	GetCustomNetConf() *cnitypes.NetConf
+	GetCiliumNetConf() (*cnitypes.NetConf, []byte, error)
 
 	// ExternalRoutingEnabled returns true if the chained plugin implements
 	// routing for Endpoints (Pods).

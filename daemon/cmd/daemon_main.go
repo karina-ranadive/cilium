@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	cnicell "github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/daemon/cmd/legacy"
 	"github.com/cilium/cilium/daemon/infraendpoints"
 	"github.com/cilium/cilium/daemon/k8s"
@@ -1220,6 +1221,9 @@ type daemonParams struct {
 	LocalCiliumNodeRes  k8s.LocalCiliumNodeResource
 	K8sWatcher          *watchers.K8sWatcher
 	NodeHandler         datapath.NodeHandler
+	NodeAddressing      datapath.NodeAddressing
+	CNIConfigManager    cnicell.CNIConfigManager
+	EndpointCreator     endpointcreator.EndpointCreator
 	EndpointManager     endpointmanager.EndpointManager
 	EndpointRestorer    *endpointRestorer
 	IdentityAllocator   identitycell.CachingIdentityAllocator

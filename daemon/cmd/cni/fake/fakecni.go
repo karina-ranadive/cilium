@@ -27,6 +27,10 @@ func (f *FakeCNIConfigManager) GetCustomNetConf() *cnitypes.NetConf {
 	return nil
 }
 
+func (f *FakeCNIConfigManager) GetCiliumNetConf() (*cnitypes.NetConf, []byte, error) {
+	return nil, nil, nil
+}
+
 func (f *FakeCNIConfigManager) Status() *models.Status {
 	return nil
 }

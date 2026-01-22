@@ -689,7 +689,7 @@ func TestCheckIPAMDelegatedPlugin(t *testing.T) {
 				IPAM:              ipamOption.IPAMDelegatedPlugin,
 				EnableEnvoyConfig: true,
 			},
-			expectErr: fmt.Errorf("--enable-envoy-config must be disabled with --ipam=delegated-plugin"),
+			expectErr: nil,
 		},
 	}
 
