@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 
 	ztunnel "github.com/cilium/cilium/operator/pkg/ztunnel/config"
 	"github.com/cilium/cilium/pkg/backoff"
@@ -59,6 +60,10 @@ type ClientConfig struct {
 	SpireServerAddress           string        `mapstructure:"mesh-auth-spire-server-address"`
 	SpireServerConnectionTimeout time.Duration `mapstructure:"mesh-auth-spire-server-connection-timeout"`
 	SpiffeTrustDomain            string        `mapstructure:"mesh-auth-spiffe-trust-domain"`
+	// UseCRD enables CRD-based ztunnel enrollment: the Cilium Operator creates one
+	// ClusterSPIFFEID per enrolled namespace instead of calling the SPIRE server
+	// Entry API directly.
+	UseCRD bool `mapstructure:"enable-ztunnel-spiffeid-crd"`
 }
 
 var defaultClientConfig = ClientConfig{
@@ -82,6 +87,9 @@ func (cfg ClientConfig) Flags(flags *pflag.FlagSet) {
 	flags.String("mesh-auth-spiffe-trust-domain",
 		cfg.SpiffeTrustDomain,
 		"The trust domain for the SPIFFE identity.")
+	flags.Bool("enable-ztunnel-spiffeid-crd",
+		cfg.UseCRD,
+		"Enable CRD-based ztunnel enrollment: the Cilium Operator creates one ClusterSPIFFEID per enrolled namespace instead of calling the SPIRE server Entry API directly.")
 }
 
 type params struct {
@@ -110,6 +118,10 @@ type Client struct {
 	entryMutex  lock.RWMutex
 	k8sClient   k8sClient.Clientset
 	initialized chan struct{}
+	// useCRD switches registration to write ClusterSPIFFEID CRDs via
+	// dynamicClient instead of calling the SPIRE Entry API directly.
+	useCRD        bool
+	dynamicClient dynamic.Interface
 }
 
 // NewClient creates a new SPIRE client for ztunnel namespace enrollment.
@@ -118,12 +130,23 @@ func NewClient(params params) *Client {
 		return nil
 	}
 
+	var dynClient dynamic.Interface
+	if params.ClientConfig.UseCRD {
+		var err error
+		dynClient, err = dynamic.NewForConfig(params.K8sClient.RestConfig())
+		if err != nil {
+			params.Logger.Error("Failed to create dynamic client for SPIRE CRD backend", logfields.Error, err)
+		}
+	}
+
 	client := &Client{
-		k8sClient:   params.K8sClient,
-		cfg:         params.ClientConfig,
-		entryCfg:    params.EntryConfig,
-		log:         params.Logger.With(logfields.LogSubsys, "spire-client"),
-		initialized: make(chan struct{}),
+		k8sClient:     params.K8sClient,
+		cfg:           params.ClientConfig,
+		entryCfg:      params.EntryConfig,
+		log:           params.Logger.With(logfields.LogSubsys, "spire-client"),
+		initialized:   make(chan struct{}),
+		useCRD:        params.ClientConfig.UseCRD,
+		dynamicClient: dynClient,
 	}
 
 	params.Lifecycle.Append(cell.Hook{
@@ -139,6 +162,14 @@ func (c *Client) Initialized() <-chan struct{} {
 }
 
 func (c *Client) onStart(ctx cell.HookContext) error {
+	if c.useCRD {
+		if c.dynamicClient == nil {
+			return fmt.Errorf("SPIRE CRD backend enabled but dynamic client is not initialized")
+		}
+		c.log.InfoContext(ctx, "SPIRE CRD backend enabled; skipping direct SPIRE server connection")
+		close(c.initialized)
+		return nil
+	}
 	go func() {
 		c.log.InfoContext(ctx, "Initializing SPIRE client")
 		attempts := 0
@@ -214,6 +245,9 @@ func (c *Client) connect(ctx context.Context) (*grpc.ClientConn, error) {
 // Upsert creates or updates the SPIFFE ID for the given ID.
 // The SPIFFE ID path and selectors are determined by the SpireEntryConfig.
 func (c *Client) Upsert(ctx context.Context, id string) error {
+	if c.useCRD {
+		return c.upsertCRD(ctx, id)
+	}
 	c.entryMutex.RLock()
 	defer c.entryMutex.RUnlock()
 	if c.entry == nil {
@@ -271,6 +305,9 @@ func (c *Client) Upsert(ctx context.Context, id string) error {
 // UpsertBatch creates or updates multiple SPIFFE entries at once.
 // For each ID, it checks if an entry exists and updates it, otherwise creates it.
 func (c *Client) UpsertBatch(ctx context.Context, ids []string) error {
+	if c.useCRD {
+		return c.upsertCRDBatch(ctx, ids)
+	}
 	c.entryMutex.RLock()
 	defer c.entryMutex.RUnlock()
 
@@ -362,6 +399,9 @@ func (c *Client) UpsertBatch(ctx context.Context, ids []string) error {
 // Delete deletes the SPIFFE ID for the given ID.
 // The SPIFFE ID path is determined by the SpireEntryConfig.
 func (c *Client) Delete(ctx context.Context, id string) error {
+	if c.useCRD {
+		return c.deleteCRD(ctx, id)
+	}
 	c.entryMutex.RLock()
 	defer c.entryMutex.RUnlock()
 	if c.entry == nil {
@@ -398,6 +438,9 @@ func (c *Client) Delete(ctx context.Context, id string) error {
 // It lists all entries by parent ID, filters to the requested IDs, and deletes in batches.
 // This is more efficient than looking up each entry individually.
 func (c *Client) DeleteBatch(ctx context.Context, ids []string) error {
+	if c.useCRD {
+		return c.deleteCRDBatch(ctx, ids)
+	}
 	c.entryMutex.RLock()
 	defer c.entryMutex.RUnlock()
 	if c.entry == nil {

@@ -84,9 +84,12 @@ func (ops *EnrollmentReconciler) Delete(ctx context.Context, txn statedb.ReadTxn
 	for sa := range sas {
 		ids = append(ids, fmt.Sprintf("%s/%s", sa.Namespace, sa.Name))
 	}
+	// Always include the namespace itself so backends with a namespace-scoped
+	// registration (e.g. the CRD backend's per-namespace ClusterSPIFFEID) clean it
+	// up on unenrollment even when the namespace currently has no service accounts.
+	// Otherwise that resource leaks.
 	if len(ids) == 0 {
-		ops.logger.Info("No service accounts found in deleted enrolled namespace", logfields.K8sNamespace, ns.Name)
-		return nil
+		ids = append(ids, ns.Name+"/")
 	}
 	err := ops.spireClient.DeleteBatch(ctx, ids)
 	if err != nil {
